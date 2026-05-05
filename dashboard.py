@@ -26,6 +26,90 @@ from plotly.subplots import make_subplots
 import httpx
 import yaml
 
+import pickle
+import pandas as pd
+from src.features.engineer import (
+    compute_return_features, compute_moving_averages,
+    compute_volatility_features, compute_volume_features,
+    compute_technical_indicators, compute_market_features,
+    FEATURE_COLUMNS
+)
+
+def load_model_direct():
+    """Load champion model directly from file."""
+    model_path = ROOT / "models/registry/champion_model.pkl"
+    if model_path.exists():
+        with open(model_path, "rb") as f:
+            return pickle.load(f)
+    return None
+
+def get_live_predictions():
+    """Download fresh data and predict directly."""
+    import yfinance as yf
+    from datetime import datetime, timedelta
+    
+    tickers = CFG["universe"]["tickers"]
+    end = datetime.today().strftime("%Y-%m-%d")
+    start = (datetime.today() - timedelta(days=200)).strftime("%Y-%m-%d")
+    
+    frames = []
+    for ticker in tickers + [CFG["universe"]["benchmark"]]:
+        try:
+            df = yf.download(ticker, start=start, end=end,
+                           auto_adjust=True, progress=False)
+            if df.empty:
+                continue
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [col[0].lower() for col in df.columns]
+            else:
+                df.columns = [c.lower() for c in df.columns]
+            df.index.name = "date"
+            df = df.reset_index()
+            df["ticker"] = ticker
+            df["date"] = pd.to_datetime(df["date"])
+            frames.append(df)
+        except:
+            continue
+    
+    if not frames:
+        return None
+    
+    raw = pd.concat(frames, ignore_index=True)
+    raw = raw.sort_values(["ticker","date"]).reset_index(drop=True)
+    
+    # Build features
+    raw = compute_return_features(raw)
+    raw = compute_moving_averages(raw)
+    raw = compute_volatility_features(raw)
+    raw = compute_volume_features(raw)
+    raw = compute_technical_indicators(raw)
+    raw = compute_market_features(raw)
+    
+    # Get latest row per ticker
+    latest = raw.groupby("ticker").last().reset_index()
+    latest = latest[latest["ticker"] != CFG["universe"]["benchmark"]]
+    
+    feature_cols = [c for c in FEATURE_COLUMNS if c in latest.columns]
+    X = latest[feature_cols].fillna(0)
+    
+    model = load_model_direct()
+    if model is None:
+        return None
+    
+    probs = model.predict_proba(X)[:, 1]
+    preds = (probs > 0.5).astype(int)
+    
+    results = []
+    for i, row in latest.iterrows():
+        results.append({
+            "ticker": row["ticker"],
+            "direction": "UP" if preds[i] == 1 else "DOWN",
+            "probability": round(float(probs[i]), 4),
+            "close": round(float(row["close"]), 2)
+        })
+    
+    return pd.DataFrame(results)
+
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
