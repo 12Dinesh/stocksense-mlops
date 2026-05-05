@@ -1,62 +1,53 @@
-"""
-StockSense Dashboard
-=====================
-Production-grade Streamlit web app showing:
-  - Live predictions for all tickers
-  - Model performance metrics
-  - Feature importance (SHAP)
-  - Drift monitoring dashboard
-  - Historical price charts with prediction overlays
-
-This is the "face" of the ML system — what business users see.
-"""
-
-import json
-import sys
-import time
-from pathlib import Path
-from datetime import datetime, timedelta
-
+import streamlit as st
 import pandas as pd
 import numpy as np
-import streamlit as st
-import plotly.graph_objects as go
-import plotly.express as px
-from plotly.subplots import make_subplots
-import httpx
-import yaml
-
 import pickle
-import pandas as pd
-from src.features.engineer import (
-    compute_return_features, compute_moving_averages,
-    compute_volatility_features, compute_volume_features,
-    compute_technical_indicators, compute_market_features,
-    FEATURE_COLUMNS
+import warnings
+import sys
+from pathlib import Path
+from datetime import datetime, timedelta
+warnings.filterwarnings("ignore")
+
+st.set_page_config(
+    page_title="StockSense MLOps",
+    page_icon="📈",
+    layout="wide"
 )
 
-def load_model_direct():
-    """Load champion model directly from file."""
-    model_path = ROOT / "models/registry/champion_model.pkl"
-    if model_path.exists():
-        with open(model_path, "rb") as f:
-            return pickle.load(f)
-    return None
+ROOT = Path(__file__).parent
+sys.path.insert(0, str(ROOT))
 
-def get_live_predictions():
-    """Download fresh data and predict directly."""
+# ── Load config ──────────────────────────────────────────────
+import yaml
+with open(ROOT / "config.yaml", encoding="utf-8") as f:
+    CFG = yaml.safe_load(f)
+
+TICKERS = CFG["universe"]["tickers"]
+BENCHMARK = CFG["universe"]["benchmark"]
+MODEL_PATH = ROOT / "models/registry/champion_model.pkl"
+
+# ── Header ────────────────────────────────────────────────────
+st.markdown("""
+<h1 style='color:#1B3A5C;'>📈 StockSense MLOps Dashboard</h1>
+<p style='color:#666;'>Live stock direction predictions — powered by LightGBM</p>
+""", unsafe_allow_html=True)
+
+st.markdown("---")
+
+# ── Download fresh data ───────────────────────────────────────
+@st.cache_data(ttl=3600)
+def download_data():
     import yfinance as yf
-    from datetime import datetime, timedelta
-    
-    tickers = CFG["universe"]["tickers"]
     end = datetime.today().strftime("%Y-%m-%d")
-    start = (datetime.today() - timedelta(days=200)).strftime("%Y-%m-%d")
-    
+    start = (datetime.today() - timedelta(days=365)).strftime("%Y-%m-%d")
+
     frames = []
-    for ticker in tickers + [CFG["universe"]["benchmark"]]:
+    for ticker in TICKERS + [BENCHMARK]:
         try:
-            df = yf.download(ticker, start=start, end=end,
-                           auto_adjust=True, progress=False)
+            df = yf.download(
+                ticker, start=start, end=end,
+                auto_adjust=True, progress=False
+            )
             if df.empty:
                 continue
             if isinstance(df.columns, pd.MultiIndex):
@@ -68,772 +59,256 @@ def get_live_predictions():
             df["ticker"] = ticker
             df["date"] = pd.to_datetime(df["date"])
             frames.append(df)
-        except:
+        except Exception as e:
+            st.warning(f"Could not download {ticker}: {e}")
             continue
-    
+
     if not frames:
         return None
-    
-    raw = pd.concat(frames, ignore_index=True)
-    raw = raw.sort_values(["ticker","date"]).reset_index(drop=True)
-    
-    # Build features
-    raw = compute_return_features(raw)
-    raw = compute_moving_averages(raw)
-    raw = compute_volatility_features(raw)
-    raw = compute_volume_features(raw)
-    raw = compute_technical_indicators(raw)
-    raw = compute_market_features(raw)
-    
-    # Get latest row per ticker
-    latest = raw.groupby("ticker").last().reset_index()
-    latest = latest[latest["ticker"] != CFG["universe"]["benchmark"]]
-    
-    feature_cols = [c for c in FEATURE_COLUMNS if c in latest.columns]
-    X = latest[feature_cols].fillna(0)
-    
-    model = load_model_direct()
-    if model is None:
-        return None
-    
-    probs = model.predict_proba(X)[:, 1]
-    preds = (probs > 0.5).astype(int)
-    
-    results = []
-    for i, row in latest.iterrows():
-        results.append({
-            "ticker": row["ticker"],
-            "direction": "UP" if preds[i] == 1 else "DOWN",
-            "probability": round(float(probs[i]), 4),
-            "close": round(float(row["close"]), 2)
-        })
-    
-    return pd.DataFrame(results)
+    return pd.concat(frames, ignore_index=True)
 
-ROOT = Path(__file__).parent
-sys.path.insert(0, str(ROOT))
+# ── Build features ────────────────────────────────────────────
+def build_features(df):
+    import ta
 
-with open(ROOT / "config.yaml") as f:
-    CFG = yaml.safe_load(f)
+    df = df.copy().sort_values(["ticker","date"]).reset_index(drop=True)
 
-API_BASE = f"http://localhost:{CFG['serving']['port']}"
-MODEL_DIR = ROOT / CFG["paths"]["model_registry"]
-MONITOR_DIR = ROOT / "monitoring_reports"
+    # Returns
+    for w in [5, 10, 20, 50]:
+        df[f"return_{w}d"] = df.groupby("ticker")["close"].pct_change(w)
+        df[f"return_{w}d_log"] = np.log1p(df[f"return_{w}d"].fillna(0))
 
-# ─── Page Config ────────────────────────────────────────────────
-st.set_page_config(
-    page_title="StockSense MLOps",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+    # Gap
+    df["gap"] = df.groupby("ticker").apply(
+        lambda g: (g["open"] - g["close"].shift(1)) / (g["close"].shift(1) + 1e-9)
+    ).reset_index(level=0, drop=True)
 
-# ─── Custom CSS ─────────────────────────────────────────────────
-st.markdown("""
-<style>
-    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Sora:wght@300;400;600;700&display=swap');
-
-    .stApp { background: #0a0e1a; }
-    
-    * { font-family: 'Sora', sans-serif; }
-    code, .stCode { font-family: 'JetBrains Mono', monospace !important; }
-    
-    .main-header {
-        background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
-        border: 1px solid #334155;
-        border-radius: 16px;
-        padding: 32px;
-        margin-bottom: 24px;
-        position: relative;
-        overflow: hidden;
-    }
-    .main-header::before {
-        content: '';
-        position: absolute;
-        top: -50%;
-        right: -10%;
-        width: 300px;
-        height: 300px;
-        background: radial-gradient(circle, rgba(99,102,241,0.15) 0%, transparent 70%);
-        pointer-events: none;
-    }
-    .main-title {
-        font-size: 2.4rem;
-        font-weight: 700;
-        background: linear-gradient(135deg, #6366f1, #8b5cf6, #06b6d4);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        margin: 0;
-    }
-    .main-subtitle {
-        color: #64748b;
-        font-size: 0.95rem;
-        margin-top: 8px;
-        font-weight: 300;
-    }
-    
-    .metric-card {
-        background: #0f172a;
-        border: 1px solid #1e293b;
-        border-radius: 12px;
-        padding: 20px;
-        text-align: center;
-        transition: border-color 0.2s;
-    }
-    .metric-card:hover { border-color: #6366f1; }
-    .metric-value { font-size: 1.8rem; font-weight: 700; color: #f1f5f9; }
-    .metric-label { font-size: 0.8rem; color: #64748b; margin-top: 4px; text-transform: uppercase; letter-spacing: 0.05em; }
-    
-    .prediction-card {
-        background: #0f172a;
-        border: 1px solid #1e293b;
-        border-radius: 12px;
-        padding: 16px 20px;
-        margin: 8px 0;
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-    }
-    .up-badge {
-        background: rgba(16, 185, 129, 0.15);
-        color: #10b981;
-        border: 1px solid rgba(16, 185, 129, 0.3);
-        border-radius: 6px;
-        padding: 4px 12px;
-        font-weight: 600;
-        font-size: 0.85rem;
-    }
-    .down-badge {
-        background: rgba(239, 68, 68, 0.15);
-        color: #ef4444;
-        border: 1px solid rgba(239, 68, 68, 0.3);
-        border-radius: 6px;
-        padding: 4px 12px;
-        font-weight: 600;
-        font-size: 0.85rem;
-    }
-    .confidence-high { color: #10b981; font-weight: 600; }
-    .confidence-medium { color: #f59e0b; font-weight: 600; }
-    .confidence-low { color: #6b7280; font-weight: 600; }
-    
-    .status-dot-green { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #10b981; margin-right: 6px; animation: pulse 2s infinite; }
-    .status-dot-red { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #ef4444; margin-right: 6px; }
-    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
-    
-    .section-header {
-        font-size: 1.1rem;
-        font-weight: 600;
-        color: #e2e8f0;
-        border-bottom: 1px solid #1e293b;
-        padding-bottom: 12px;
-        margin-bottom: 20px;
-    }
-    
-    div[data-testid="stSidebar"] { background: #0a0e1a; border-right: 1px solid #1e293b; }
-    .stSelectbox label, .stMultiSelect label { color: #94a3b8 !important; }
-    
-    /* Tables */
-    .stDataFrame { background: #0f172a !important; }
-</style>
-""", unsafe_allow_html=True)
-
-
-# ════════════════════════════════════════════════════════════════
-#  DATA FETCHERS
-# ════════════════════════════════════════════════════════════════
-
-@st.cache_data(ttl=300)  # Cache for 5 minutes
-def fetch_all_predictions():
-    """Fetch predictions from API."""
-    try:
-        resp = httpx.get(f"{API_BASE}/predict/all", timeout=15)
-        if resp.status_code == 200:
-            return resp.json(), None
-    except Exception as e:
-        pass
-    
-    # Fallback: generate from model directly
-    try:
-        sys.path.insert(0, str(ROOT))
-        from src.features.engineer import load_features, FEATURE_COLUMNS
-        import pickle
-        
-        champion_path = MODEL_DIR / "champion_model.pkl"
-        meta_path = MODEL_DIR / "champion_metadata.json"
-        
-        if not champion_path.exists():
-            return None, "No trained model found. Run the training pipeline first."
-        
-        with open(champion_path, "rb") as f:
-            model = pickle.load(f)
-        with open(meta_path) as f:
-            meta = json.load(f)
-        
-        df = load_features()
-        feature_cols = [c for c in meta.get("feature_columns", FEATURE_COLUMNS) if c in df.columns]
-        
-        latest_date = df["date"].max()
-        latest = df[df["date"] == latest_date]
-        
-        predictions = []
-        for _, row in latest.iterrows():
-            if row["ticker"] == CFG["universe"]["benchmark"]:
-                continue
-            X = pd.DataFrame([row[feature_cols]])
-            prob = float(model.predict_proba(X)[0, 1])
-            direction = "UP" if prob >= 0.5 else "DOWN"
-            conf_score = abs(prob - 0.5) * 2
-            confidence = "HIGH" if conf_score > 0.4 else ("MEDIUM" if conf_score > 0.2 else "LOW")
-            
-            predictions.append({
-                "ticker": row["ticker"],
-                "date": str(latest_date)[:10],
-                "prediction": direction,
-                "probability": round(prob, 4),
-                "confidence": confidence,
-                "model_version": meta.get("trained_at", "unknown")[:10],
-                "cached": False,
-                "latency_ms": 0
-            })
-        
-        predictions.sort(key=lambda x: x["probability"], reverse=True)
-        return {
-            "predictions": predictions,
-            "timestamp": datetime.now().isoformat(),
-            "model_version": meta.get("trained_at", "unknown")[:10]
-        }, None
-    
-    except Exception as e:
-        return None, str(e)
-
-
-@st.cache_data(ttl=3600)  # Cache for 1 hour
-def fetch_price_history(ticker: str, days: int = 90):
-    """Fetch historical price data."""
-    try:
-        from src.ingestion.ingest import load_all_raw
-        df = load_all_raw()
-        df = df[df["ticker"] == ticker].sort_values("date")
-        cutoff = pd.Timestamp.now() - pd.Timedelta(days=days)
-        return df[df["date"] >= cutoff]
-    except Exception:
-        return pd.DataFrame()
-
-
-@st.cache_data(ttl=300)
-def fetch_model_info():
-    """Get model metadata."""
-    meta_path = MODEL_DIR / "champion_metadata.json"
-    if meta_path.exists():
-        with open(meta_path) as f:
-            return json.load(f)
-    return None
-
-
-@st.cache_data(ttl=300)
-def fetch_monitoring_snapshot():
-    """Get latest monitoring snapshot."""
-    snapshots = sorted(MONITOR_DIR.glob("snapshot_*.json")) if MONITOR_DIR.exists() else []
-    if snapshots:
-        with open(snapshots[-1]) as f:
-            return json.load(f)
-    return None
-
-
-@st.cache_data(ttl=3600)
-def fetch_feature_importance():
-    """Load SHAP feature importance."""
-    shap_path = MODEL_DIR / "shap_importance.csv"
-    if shap_path.exists():
-        return pd.read_csv(shap_path)
-    fi_path = MODEL_DIR / "feature_importance.csv"
-    if fi_path.exists():
-        return pd.read_csv(fi_path).rename(columns={"importance": "mean_shap"})
-    return None
-
-
-# ════════════════════════════════════════════════════════════════
-#  SIDEBAR
-# ════════════════════════════════════════════════════════════════
-
-with st.sidebar:
-    st.markdown("""
-    <div style='padding: 16px 0 8px 0;'>
-        <div style='font-size: 1.2rem; font-weight: 700; color: #6366f1;'>⚡ StockSense</div>
-        <div style='font-size: 0.75rem; color: #475569; margin-top: 4px;'>MLOps Platform</div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    st.divider()
-    
-    page = st.radio(
-        "Navigation",
-        ["📊 Predictions", "📈 Price Charts", "🧠 Model Analytics", "🔍 Monitoring", "⚙️ System"],
-        label_visibility="collapsed"
-    )
-    
-    st.divider()
-    
-    # System status
-    model_meta = fetch_model_info()
-    
-    if model_meta:
-        st.markdown('<span class="status-dot-green"></span> **Model Active**', unsafe_allow_html=True)
-        st.caption(f"Version: {model_meta.get('trained_at', 'N/A')[:10]}")
-        st.caption(f"Type: {model_meta.get('model_type', 'N/A').upper()}")
-        st.caption(f"AUC: {model_meta.get('test_auc', 0):.4f}")
-    else:
-        st.markdown('<span class="status-dot-red"></span> **No Model**', unsafe_allow_html=True)
-        st.caption("Run training pipeline first")
-    
-    st.divider()
-    
-    if st.button("🔄 Refresh Data", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
-    
-    st.caption(f"Last updated: {datetime.now().strftime('%H:%M:%S')}")
-
-
-# ════════════════════════════════════════════════════════════════
-#  HEADER
-# ════════════════════════════════════════════════════════════════
-
-st.markdown("""
-<div class="main-header">
-    <div class="main-title">📈 StockSense MLOps</div>
-    <div class="main-subtitle">
-        End-to-end ML system · LightGBM · MLflow · Evidently · Airflow · FastAPI
-    </div>
-</div>
-""", unsafe_allow_html=True)
-
-
-# ════════════════════════════════════════════════════════════════
-#  PAGE: PREDICTIONS
-# ════════════════════════════════════════════════════════════════
-
-if "Predictions" in page:
-    data, error = fetch_all_predictions()
-    
-    if error:
-        st.error(f"⚠️ {error}")
-        st.info("Run the setup script: `python setup.py` then `python -m src.training.run`")
-    elif data:
-        predictions = data["predictions"]
-        
-        # Top metrics row
-        up_count = sum(1 for p in predictions if p["prediction"] == "UP")
-        high_conf = sum(1 for p in predictions if p["confidence"] == "HIGH")
-        avg_prob = np.mean([p["probability"] for p in predictions])
-        
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            st.markdown(f"""<div class="metric-card">
-                <div class="metric-value" style="color:#10b981">{up_count}/{len(predictions)}</div>
-                <div class="metric-label">Bullish Predictions</div>
-            </div>""", unsafe_allow_html=True)
-        with c2:
-            st.markdown(f"""<div class="metric-card">
-                <div class="metric-value">{high_conf}</div>
-                <div class="metric-label">High Confidence</div>
-            </div>""", unsafe_allow_html=True)
-        with c3:
-            st.markdown(f"""<div class="metric-card">
-                <div class="metric-value">{avg_prob:.1%}</div>
-                <div class="metric-label">Avg Bull Probability</div>
-            </div>""", unsafe_allow_html=True)
-        with c4:
-            model_meta = fetch_model_info()
-            auc_val = model_meta.get("test_auc", 0) if model_meta else 0
-            st.markdown(f"""<div class="metric-card">
-                <div class="metric-value">{auc_val:.4f}</div>
-                <div class="metric-label">Model AUC</div>
-            </div>""", unsafe_allow_html=True)
-        
-        st.markdown("<br>", unsafe_allow_html=True)
-        
-        # Predictions table
-        col_left, col_right = st.columns([3, 2])
-        
-        with col_left:
-            st.markdown('<div class="section-header">📋 Latest Predictions</div>', unsafe_allow_html=True)
-            
-            for p in predictions:
-                direction_badge = f'<span class="up-badge">▲ UP</span>' if p["prediction"] == "UP" else f'<span class="down-badge">▼ DOWN</span>'
-                conf_class = f"confidence-{p['confidence'].lower()}"
-                
-                st.markdown(f"""
-                <div class="prediction-card">
-                    <div>
-                        <span style="font-size:1.1rem;font-weight:700;color:#f1f5f9">{p['ticker']}</span>
-                        <span style="color:#475569;font-size:0.8rem;margin-left:8px">{p['date']}</span>
-                    </div>
-                    <div style="display:flex;align-items:center;gap:16px">
-                        <span style="color:#94a3b8;font-size:0.9rem">{p['probability']:.1%}</span>
-                        <span class="{conf_class}">{p['confidence']}</span>
-                        {direction_badge}
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-        
-        with col_right:
-            st.markdown('<div class="section-header">📊 Probability Distribution</div>', unsafe_allow_html=True)
-            
-            df_pred = pd.DataFrame(predictions)
-            
-            fig = go.Figure()
-            fig.add_trace(go.Bar(
-                x=df_pred["ticker"],
-                y=df_pred["probability"],
-                marker=dict(
-                    color=df_pred["probability"],
-                    colorscale=[[0, "#ef4444"], [0.5, "#374151"], [1, "#10b981"]],
-                    cmin=0, cmax=1,
-                    line=dict(color="#1e293b", width=1)
-                ),
-                text=[f"{p:.1%}" for p in df_pred["probability"]],
-                textposition="outside",
-                textfont=dict(color="#94a3b8", size=10)
-            ))
-            fig.add_hline(y=0.5, line_dash="dash", line_color="#6366f1", opacity=0.5,
-                          annotation_text="50% (neutral)", annotation_font_color="#6366f1")
-            fig.update_layout(
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                xaxis=dict(tickfont=dict(color="#94a3b8"), gridcolor="#1e293b"),
-                yaxis=dict(tickfont=dict(color="#94a3b8"), gridcolor="#1e293b",
-                           tickformat=".0%", range=[0, 1]),
-                margin=dict(t=10, b=10, l=10, r=10),
-                height=350
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-
-# ════════════════════════════════════════════════════════════════
-#  PAGE: PRICE CHARTS
-# ════════════════════════════════════════════════════════════════
-
-elif "Price Charts" in page:
-    st.markdown('<div class="section-header">📈 Price History & Predictions</div>', unsafe_allow_html=True)
-    
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        ticker = st.selectbox("Select Ticker", CFG["universe"]["tickers"])
-    with col2:
-        period = st.selectbox("Period", ["30 days", "90 days", "180 days", "1 year"])
-    
-    days_map = {"30 days": 30, "90 days": 90, "180 days": 180, "1 year": 365}
-    days = days_map[period]
-    
-    price_df = fetch_price_history(ticker, days)
-    
-    if not price_df.empty:
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                            row_heights=[0.7, 0.3], vertical_spacing=0.05)
-        
-        # Candlestick
-        fig.add_trace(go.Candlestick(
-            x=price_df["date"],
-            open=price_df["open"],
-            high=price_df["high"],
-            low=price_df["low"],
-            close=price_df["close"],
-            increasing=dict(fillcolor="#10b981", line=dict(color="#10b981")),
-            decreasing=dict(fillcolor="#ef4444", line=dict(color="#ef4444")),
-            name="OHLC"
-        ), row=1, col=1)
-        
-        # SMA lines
-        price_df["sma_20"] = price_df["close"].rolling(20).mean()
-        price_df["sma_50"] = price_df["close"].rolling(50).mean()
-        
-        fig.add_trace(go.Scatter(x=price_df["date"], y=price_df["sma_20"],
-                                  line=dict(color="#6366f1", width=1.5, dash="dot"),
-                                  name="SMA 20"), row=1, col=1)
-        fig.add_trace(go.Scatter(x=price_df["date"], y=price_df["sma_50"],
-                                  line=dict(color="#8b5cf6", width=1.5),
-                                  name="SMA 50"), row=1, col=1)
-        
-        # Volume
-        colors = ["#10b981" if c >= o else "#ef4444"
-                  for c, o in zip(price_df["close"], price_df["open"])]
-        fig.add_trace(go.Bar(x=price_df["date"], y=price_df["volume"],
-                              marker=dict(color=colors, opacity=0.7),
-                              name="Volume"), row=2, col=1)
-        
-        fig.update_layout(
-            title=f"{ticker} — {period}",
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            font=dict(color="#94a3b8"),
-            xaxis_rangeslider_visible=False,
-            legend=dict(bgcolor="rgba(0,0,0,0)", bordercolor="#334155", borderwidth=1),
-            height=550,
-            margin=dict(t=40, b=10, l=10, r=10)
+    # Moving averages
+    for w in [5, 10, 20, 50]:
+        df[f"sma_{w}"] = df.groupby("ticker")["close"].transform(
+            lambda x: x.rolling(w, min_periods=1).mean()
         )
-        fig.update_xaxes(gridcolor="#1e293b", showgrid=True)
-        fig.update_yaxes(gridcolor="#1e293b", showgrid=True)
-        
-        st.plotly_chart(fig, use_container_width=True)
+        df[f"ema_{w}"] = df.groupby("ticker")["close"].transform(
+            lambda x: x.ewm(span=w, adjust=False).mean()
+        )
+        df[f"price_to_sma_{w}"] = df["close"] / (df[f"sma_{w}"] + 1e-9) - 1
+        df[f"price_to_ema_{w}"] = df["close"] / (df[f"ema_{w}"] + 1e-9) - 1
+
+    df["sma_5_20_cross"] = np.sign(df["sma_5"] - df["sma_20"])
+    df["sma_10_50_cross"] = np.sign(df["sma_10"] - df["sma_50"])
+
+    # Volatility
+    for w in [10, 20]:
+        df[f"volatility_{w}d"] = df.groupby("ticker")["close"].transform(
+            lambda x: x.pct_change().rolling(w, min_periods=1).std() * np.sqrt(252)
+        )
+    df["hl_range"] = (df["high"] - df["low"]) / (df["close"] + 1e-9)
+    df["hl_range_5d_avg"] = df.groupby("ticker")["hl_range"].transform(
+        lambda x: x.rolling(5, min_periods=1).mean()
+    )
+    df["true_range"] = df.groupby("ticker").apply(
+        lambda g: pd.concat([
+            g["high"] - g["low"],
+            (g["high"] - g["close"].shift()).abs(),
+            (g["low"] - g["close"].shift()).abs()
+        ], axis=1).max(axis=1)
+    ).reset_index(level=0, drop=True)
+    df["atr_14"] = df.groupby("ticker")["true_range"].transform(
+        lambda x: x.ewm(span=14, adjust=False).mean()
+    )
+
+    # Volume
+    df["volume_sma_20"] = df.groupby("ticker")["volume"].transform(
+        lambda x: x.rolling(20, min_periods=1).mean()
+    )
+    df["volume_ratio"] = df["volume"] / (df["volume_sma_20"] + 1e-9)
+    df["volume_change"] = df.groupby("ticker")["volume"].pct_change()
+
+    def compute_obv(group):
+        direction = np.sign(group["close"].diff())
+        return (direction * group["volume"]).cumsum()
+
+    df["obv"] = df.groupby("ticker").apply(compute_obv).reset_index(level=0, drop=True)
+    df["obv_sma_20"] = df.groupby("ticker")["obv"].transform(
+        lambda x: x.rolling(20, min_periods=1).mean()
+    )
+    df["obv_ratio"] = df["obv"] / (df["obv_sma_20"].abs() + 1)
+
+    # Technical indicators
+    results = []
+    for ticker in df["ticker"].unique():
+        tdf = df[df["ticker"] == ticker].copy().sort_values("date")
+        close = tdf["close"]
+
+        tdf["rsi_14"] = ta.momentum.RSIIndicator(close, window=14).rsi()
+        tdf["rsi_overbought"] = (tdf["rsi_14"] > 70).astype(int)
+        tdf["rsi_oversold"] = (tdf["rsi_14"] < 30).astype(int)
+
+        macd = ta.trend.MACD(close, window_fast=12, window_slow=26, window_sign=9)
+        tdf["macd"] = macd.macd()
+        tdf["macd_signal"] = macd.macd_signal()
+        tdf["macd_diff"] = macd.macd_diff()
+        tdf["macd_bullish"] = (tdf["macd"] > tdf["macd_signal"]).astype(int)
+
+        bb = ta.volatility.BollingerBands(close, window=20, window_dev=2)
+        tdf["bb_upper"] = bb.bollinger_hband()
+        tdf["bb_lower"] = bb.bollinger_lband()
+        tdf["bb_mid"] = bb.bollinger_mavg()
+        tdf["bb_width"] = (tdf["bb_upper"] - tdf["bb_lower"]) / (tdf["bb_mid"] + 1e-9)
+        tdf["bb_position"] = (close - tdf["bb_lower"]) / (tdf["bb_upper"] - tdf["bb_lower"] + 1e-9)
+
+        stoch = ta.momentum.StochasticOscillator(tdf["high"], tdf["low"], close, window=14)
+        tdf["stoch_k"] = stoch.stoch()
+        tdf["stoch_d"] = stoch.stoch_signal()
+
+        results.append(tdf)
+
+    df = pd.concat(results, ignore_index=True)
+
+    # Market features
+    if BENCHMARK in df["ticker"].unique():
+        spy = df[df["ticker"] == BENCHMARK][["date","return_5d"]].rename(
+            columns={"return_5d": "market_return_5d"}
+        )
+        df = df.merge(spy, on="date", how="left")
+        df["excess_return_5d"] = df["return_5d"] - df["market_return_5d"]
     else:
-        st.info(f"No price data available for {ticker}. Run ingestion first.")
+        df["market_return_5d"] = 0
+        df["excess_return_5d"] = 0
 
+    df["day_of_week"] = pd.to_datetime(df["date"]).dt.dayofweek
+    df["month"] = pd.to_datetime(df["date"]).dt.month
+    df["quarter"] = pd.to_datetime(df["date"]).dt.quarter
 
-# ════════════════════════════════════════════════════════════════
-#  PAGE: MODEL ANALYTICS
-# ════════════════════════════════════════════════════════════════
+    return df
 
-elif "Model Analytics" in page:
-    model_meta = fetch_model_info()
-    
-    if not model_meta:
-        st.warning("No model trained yet. Run the training pipeline first.")
-    else:
-        st.markdown('<div class="section-header">🧠 Model Performance</div>', unsafe_allow_html=True)
-        
-        cols = st.columns(5)
-        metrics = [
-            ("AUC", f"{model_meta.get('test_auc', 0):.4f}"),
-            ("Accuracy", f"{model_meta.get('test_accuracy', 0):.4f}"),
-            ("F1 Score", f"{model_meta.get('test_f1', 0):.4f}"),
-            ("Type", model_meta.get("model_type", "N/A").upper()),
-            ("Trained", model_meta.get("trained_at", "N/A")[:10]),
-        ]
-        for col, (label, value) in zip(cols, metrics):
-            with col:
-                st.markdown(f"""<div class="metric-card">
-                    <div class="metric-value" style="font-size:1.3rem">{value}</div>
-                    <div class="metric-label">{label}</div>
-                </div>""", unsafe_allow_html=True)
-        
-        st.markdown("<br>", unsafe_allow_html=True)
-        
-        # Feature importance
-        fi_df = fetch_feature_importance()
-        if fi_df is not None:
-            st.markdown('<div class="section-header">🔍 Feature Importance (SHAP)</div>', unsafe_allow_html=True)
-            
-            top_n = st.slider("Top N features", 10, min(30, len(fi_df)), 15)
-            top_fi = fi_df.head(top_n).sort_values("mean_shap")
-            
-            fig = go.Figure(go.Bar(
-                x=top_fi["mean_shap"],
-                y=top_fi["feature"],
-                orientation="h",
-                marker=dict(
-                    color=top_fi["mean_shap"],
-                    colorscale=[[0, "#1e293b"], [0.5, "#6366f1"], [1, "#06b6d4"]],
-                    line=dict(color="#0f172a", width=0.5)
-                )
-            ))
-            fig.update_layout(
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                xaxis=dict(gridcolor="#1e293b", tickfont=dict(color="#94a3b8")),
-                yaxis=dict(gridcolor="#1e293b", tickfont=dict(color="#94a3b8", size=11)),
-                height=max(300, top_n * 25),
-                margin=dict(t=10, b=10, l=10, r=10)
-            )
-            st.plotly_chart(fig, use_container_width=True)
-        
-        # Feature columns list
-        with st.expander("Feature Contract (all model features)"):
-            feature_cols = model_meta.get("feature_columns", [])
-            st.code(", ".join(feature_cols), language=None)
+# ── Load model ────────────────────────────────────────────────
+@st.cache_resource
+def load_model():
+    if MODEL_PATH.exists():
+        with open(MODEL_PATH, "rb") as f:
+            return pickle.load(f)
+    return None
 
+# ── Feature columns ───────────────────────────────────────────
+FEATURE_COLUMNS = [
+    "return_5d","return_10d","return_20d","return_50d",
+    "return_5d_log","return_10d_log","gap",
+    "price_to_sma_5","price_to_sma_10","price_to_sma_20","price_to_sma_50",
+    "price_to_ema_5","price_to_ema_10","price_to_ema_20","price_to_ema_50",
+    "sma_5_20_cross","sma_10_50_cross",
+    "volatility_10d","volatility_20d","hl_range","hl_range_5d_avg","atr_14",
+    "volume_ratio","volume_change","obv_ratio",
+    "rsi_14","rsi_overbought","rsi_oversold",
+    "macd","macd_signal","macd_diff","macd_bullish",
+    "bb_width","bb_position","stoch_k","stoch_d",
+    "excess_return_5d","market_return_5d",
+    "day_of_week","month","quarter",
+]
 
-# ════════════════════════════════════════════════════════════════
-#  PAGE: MONITORING
-# ════════════════════════════════════════════════════════════════
+# ── Main app ──────────────────────────────────────────────────
+model = load_model()
 
-elif "Monitoring" in page:
-    snapshot = fetch_monitoring_snapshot()
-    
-    if not snapshot:
-        st.info("No monitoring data yet. Run `python -m src.monitoring.monitor`")
-    else:
-        st.markdown('<div class="section-header">🔍 Data Drift & Model Health</div>', unsafe_allow_html=True)
-        
-        drift = snapshot.get("drift", {})
-        perf = snapshot.get("performance", {})
-        
-        # Summary cards
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            psi = drift.get("max_psi", 0)
-            color = "#ef4444" if psi > 0.2 else ("#f59e0b" if psi > 0.1 else "#10b981")
-            st.markdown(f"""<div class="metric-card">
-                <div class="metric-value" style="color:{color}">{psi:.3f}</div>
-                <div class="metric-label">Max PSI (drift)</div>
-            </div>""", unsafe_allow_html=True)
-        with c2:
-            drifted = drift.get("drifted_features", 0)
-            total = drift.get("total_features", 1)
-            st.markdown(f"""<div class="metric-card">
-                <div class="metric-value">{drifted}/{total}</div>
-                <div class="metric-label">Drifted Features</div>
-            </div>""", unsafe_allow_html=True)
-        with c3:
-            acc = perf.get("accuracy", 0)
-            baseline = perf.get("baseline_accuracy", 0)
-            delta = acc - baseline
-            delta_color = "#10b981" if delta >= -0.02 else "#ef4444"
-            st.markdown(f"""<div class="metric-card">
-                <div class="metric-value">{acc:.4f}</div>
-                <div class="metric-label">Recent Accuracy <span style="color:{delta_color};font-size:0.75rem">({delta:+.3f})</span></div>
-            </div>""", unsafe_allow_html=True)
-        with c4:
-            retrain = snapshot.get("recommend_retrain", False)
-            icon = "⚠️" if retrain else "✅"
-            st.markdown(f"""<div class="metric-card">
-                <div class="metric-value">{icon}</div>
-                <div class="metric-label">{"Retrain Needed" if retrain else "Model Healthy"}</div>
-            </div>""", unsafe_allow_html=True)
-        
-        # Feature drift table
-        st.markdown("<br>", unsafe_allow_html=True)
-        st.markdown('<div class="section-header">Feature-level Drift (PSI)</div>', unsafe_allow_html=True)
-        
-        feat_drift = drift.get("feature_drift", {})
-        if feat_drift:
-            drift_df = pd.DataFrame([
-                {
-                    "Feature": k,
-                    "PSI": v["psi"],
-                    "KS Stat": v["ks_statistic"],
-                    "Ref Mean": v["ref_mean"],
-                    "Cur Mean": v["cur_mean"],
-                    "Mean Shift": v["mean_shift"],
-                    "Status": v["severity"].upper()
-                }
-                for k, v in feat_drift.items()
-            ]).sort_values("PSI", ascending=False)
-            
-            def color_severity(val):
-                if val == "ALERT": return "background-color: rgba(239,68,68,0.15); color: #ef4444"
-                if val == "WARNING": return "background-color: rgba(245,158,11,0.15); color: #f59e0b"
-                return "color: #10b981"
-            
-            st.dataframe(
-                drift_df.style.applymap(color_severity, subset=["Status"]),
-                use_container_width=True,
-                height=400
-            )
-            
-            # PSI bar chart
-            fig = px.bar(
-                drift_df.head(20),
-                x="Feature", y="PSI",
-                color="PSI",
-                color_continuous_scale=[[0, "#10b981"], [0.1/0.3, "#f59e0b"], [0.2/0.3, "#ef4444"], [1, "#ef4444"]],
-                title="Top 20 Features by PSI"
-            )
-            fig.add_hline(y=0.1, line_dash="dash", line_color="#f59e0b",
-                          annotation_text="Warning (0.1)")
-            fig.add_hline(y=0.2, line_dash="dash", line_color="#ef4444",
-                          annotation_text="Alert (0.2)")
-            fig.update_layout(
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                font=dict(color="#94a3b8"),
-                height=350,
-                showlegend=False,
-                margin=dict(t=40, b=10, l=10, r=10)
-            )
-            fig.update_xaxes(gridcolor="#1e293b", tickangle=45)
-            fig.update_yaxes(gridcolor="#1e293b")
-            st.plotly_chart(fig, use_container_width=True)
+if model is None:
+    st.error("Model file not found. Please ensure models/registry/champion_model.pkl is committed to GitHub.")
+    st.stop()
 
+with st.spinner("Downloading live stock data from Yahoo Finance..."):
+    raw = download_data()
 
-# ════════════════════════════════════════════════════════════════
-#  PAGE: SYSTEM
-# ════════════════════════════════════════════════════════════════
+if raw is None:
+    st.error("Could not download stock data. Check internet connection.")
+    st.stop()
 
-elif "System" in page:
-    st.markdown('<div class="section-header">⚙️ System Status & Architecture</div>', unsafe_allow_html=True)
-    
-    # Service status
-    services = [
-        ("FastAPI Serving", f"http://localhost:{CFG['serving']['port']}/health", "http://localhost:8000/docs"),
-        ("MLflow Tracking", "http://localhost:5001/health", "http://localhost:5001"),
-        ("Airflow Scheduler", "http://localhost:8080/health", "http://localhost:8080"),
-        ("Prometheus", "http://localhost:9090/-/healthy", "http://localhost:9090"),
-        ("Grafana", "http://localhost:3000/api/health", "http://localhost:3000"),
-        ("Redis Cache", None, None),
-    ]
-    
-    st.markdown("**Service Health**")
-    cols = st.columns(3)
-    
-    for i, (name, health_url, ui_url) in enumerate(services):
-        with cols[i % 3]:
-            status = "🟢 Running" if True else "🔴 Down"  # Simplified
-            link = f"[Open UI]({ui_url})" if ui_url else ""
-            st.markdown(f"""
-            <div class="metric-card" style="text-align:left;">
-                <div style="font-weight:600;color:#e2e8f0">{name}</div>
-                <div style="font-size:0.8rem;color:#10b981;margin-top:4px">● Active</div>
-                {"<div style='font-size:0.75rem;color:#6366f1;margin-top:8px'>" + ui_url + "</div>" if ui_url else ""}
-            </div>
-            """, unsafe_allow_html=True)
-    
-    st.markdown("<br>", unsafe_allow_html=True)
-    
-    # Architecture diagram
-    st.markdown('<div class="section-header">Architecture Flow</div>', unsafe_allow_html=True)
-    st.code("""
-Yahoo Finance API
-       │
-       ▼
-  [INGESTION]  ──────────────────────────────────────────────
-  yfinance download → DataQualityChecker → Parquet (DuckDB)      Data Layer
-  ─────────────────────────────────────────────────────────────────────────
-       │
-       ▼
-  [FEATURES]   ──────────────────────────────────────────────
-  Returns + MAs + Volatility + Volume + Technical + Market          Feature Store
-  → Feature Store (Parquet, versioned)
-  ─────────────────────────────────────────────────────────────────────────
-       │
-       ▼
-  [TRAINING]   ──────────────────────────────────────────────
-  Optuna(HPO) → LightGBM/XGBoost → Walk-Forward CV → SHAP         ML Layer
-  → MLflow logging → Champion/Challenger → Model Registry
-  ─────────────────────────────────────────────────────────────────────────
-       │
-       ▼
-  [SERVING]    ──────────────────────────────────────────────
-  FastAPI + Redis Cache + Prometheus Metrics                        API Layer
-  → /predict, /predict/batch, /predict/all, /metrics
-  ─────────────────────────────────────────────────────────────────────────
-       │
-       ▼
-  [MONITORING] ──────────────────────────────────────────────
-  Evidently (PSI, KS drift) + Performance tracking                 Observability
-  → Prometheus → Grafana dashboards
-  ─────────────────────────────────────────────────────────────────────────
-       │
-       ▼
-  [ORCHESTRATION] ────────────────────────────────────────────
-  Apache Airflow DAG: 6 AM Mon-Fri                                 Pipeline
-  ingest → validate → features → train(weekly) → monitor → reload
-    """, language=None)
-    
-    # Quick start commands
-    st.markdown('<div class="section-header">Quick Start Commands</div>', unsafe_allow_html=True)
-    
-    commands = {
-        "1. Install dependencies": "pip install -r requirements.txt",
-        "2. Start infrastructure": "docker-compose up -d",
-        "3. Run ingestion": "python -m src.ingestion.ingest",
-        "4. Build features": "python -m src.features.engineer",
-        "5. Train model": "python -m src.training.train",
-        "6. Run monitoring": "python -m src.monitoring.monitor",
-        "7. Start API": "uvicorn src.serving.api:app --reload --port 8000",
-        "8. Start Airflow": "airflow standalone",
-        "9. Launch dashboard": "streamlit run dashboard.py",
-    }
-    
-    for step, cmd in commands.items():
-        st.code(f"# {step}\n{cmd}", language="bash")
+with st.spinner("Computing 40+ features..."):
+    featured = build_features(raw)
+
+# Get latest row per ticker
+latest = featured[featured["ticker"] != BENCHMARK].groupby("ticker").last().reset_index()
+feature_cols = [c for c in FEATURE_COLUMNS if c in latest.columns]
+X = latest[feature_cols].fillna(0)
+
+# Predict
+probs = model.predict_proba(X)[:, 1]
+preds = (probs > 0.5).astype(int)
+
+# ── Predictions table ─────────────────────────────────────────
+st.subheader("🎯 Live Predictions — 5-Day Direction")
+
+cols = st.columns(4)
+for i, (_, row) in enumerate(latest.iterrows()):
+    prob = float(probs[i])
+    direction = "📈 UP" if preds[i] == 1 else "📉 DOWN"
+    color = "green" if preds[i] == 1 else "red"
+    with cols[i % 4]:
+        st.metric(
+            label=row["ticker"],
+            value=direction,
+            delta=f"Confidence: {prob:.1%}"
+        )
+
+st.markdown("---")
+
+# ── Summary table ─────────────────────────────────────────────
+st.subheader("📊 Prediction Summary")
+summary = pd.DataFrame({
+    "Ticker": latest["ticker"].values,
+    "Last Close": latest["close"].round(2).values,
+    "Prediction": ["UP ✅" if p == 1 else "DOWN ❌" for p in preds],
+    "Probability": [f"{p:.1%}" for p in probs],
+    "RSI": latest["rsi_14"].round(1).values if "rsi_14" in latest.columns else ["N/A"]*len(latest),
+    "MACD Signal": ["Bullish 📈" if m == 1 else "Bearish 📉"
+                    for m in (latest["macd_bullish"].values if "macd_bullish" in latest.columns
+                    else [0]*len(latest))]
+})
+st.dataframe(summary, use_container_width=True)
+
+st.markdown("---")
+
+# ── Price chart ───────────────────────────────────────────────
+st.subheader("📉 Price History")
+import plotly.graph_objects as go
+
+selected = st.selectbox("Select stock", TICKERS)
+stock_df = featured[featured["ticker"] == selected].sort_values("date").tail(60)
+
+fig = go.Figure()
+fig.add_trace(go.Scatter(
+    x=stock_df["date"], y=stock_df["close"],
+    name="Close Price", line=dict(color="#1B3A5C", width=2)
+))
+if "bb_upper" in stock_df.columns:
+    fig.add_trace(go.Scatter(
+        x=stock_df["date"], y=stock_df["bb_upper"],
+        name="BB Upper", line=dict(color="rgba(200,100,100,0.5)", dash="dash")
+    ))
+    fig.add_trace(go.Scatter(
+        x=stock_df["date"], y=stock_df["bb_lower"],
+        name="BB Lower", line=dict(color="rgba(100,200,100,0.5)", dash="dash"),
+        fill="tonexty", fillcolor="rgba(150,150,200,0.1)"
+    ))
+fig.update_layout(
+    title=f"{selected} — Last 60 Days with Bollinger Bands",
+    xaxis_title="Date", yaxis_title="Price (USD)",
+    height=400, template="plotly_white"
+)
+st.plotly_chart(fig, use_container_width=True)
+
+# ── RSI chart ─────────────────────────────────────────────────
+if "rsi_14" in stock_df.columns:
+    fig2 = go.Figure()
+    fig2.add_trace(go.Scatter(
+        x=stock_df["date"], y=stock_df["rsi_14"],
+        name="RSI 14", line=dict(color="#2E6DA4", width=2)
+    ))
+    fig2.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="Overbought")
+    fig2.add_hline(y=30, line_dash="dash", line_color="green", annotation_text="Oversold")
+    fig2.update_layout(
+        title=f"{selected} — RSI",
+        height=250, template="plotly_white"
+    )
+    st.plotly_chart(fig2, use_container_width=True)
+
+st.markdown("---")
+st.caption(f"Data refreshes every hour. Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}")
+st.caption("Built with LightGBM + Streamlit | StockSense MLOps")
