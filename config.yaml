@@ -1,0 +1,63 @@
+project:
+  name: stocksense-mlops
+  version: "1.0.0"
+  description: "End-to-end ML system for stock return prediction"
+
+universe:
+  tickers:
+    - AAPL
+    - MSFT
+    - GOOGL
+    - AMZN
+    - NVDA
+    - TSLA
+    - META
+    - JPM
+  benchmark: "^GSPC"
+  lookback_days: 730
+
+features:
+  price_windows: [5, 10, 20, 50]
+  volatility_windows: [10, 20]
+  rsi_period: 14
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  bollinger_period: 20
+  bollinger_std: 2.0
+  target_horizon: 5
+  target_type: "direction"
+
+model:
+  primary: "lightgbm"
+  challenger: "xgboost"
+  train_split: 0.7
+  val_split: 0.15
+  test_split: 0.15
+  cv_folds: 5
+  optuna_trials: 50
+  promotion_threshold: 0.55
+
+mlflow:
+  tracking_uri: "mlruns"
+  experiment_name: "stocksense-prediction"
+  registered_model_name: "stocksense-champion"
+
+serving:
+  host: "0.0.0.0"
+  port: 8000
+  cache_ttl_seconds: 3600
+  max_prediction_age_hours: 25
+
+monitoring:
+  drift_check_days: 30
+  psi_threshold: 0.2
+  accuracy_drop_threshold: 0.05
+  alert_email: ""
+
+paths:
+  raw_data: "data/raw"
+  processed_data: "data/processed"
+  feature_store: "data/features"
+  model_registry: "models/registry"
+  logs: "logs"

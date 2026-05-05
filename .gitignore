@@ -1,0 +1,11 @@
+venv/
+data/
+models/
+logs/
+mlruns/
+monitoring_reports/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.vscode/
